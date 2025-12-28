@@ -18,6 +18,8 @@ from pymongo import MongoClient
 import bcrypt
 from datetime import timedelta
 import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 
 # Load environment variables from .env file
 load_dotenv()
@@ -150,6 +152,22 @@ def load_data():
 
 # Load dữ liệu một lần khi khởi động
 df = load_data()
+
+# --- Content-Based Recommendation Setup ---
+print("Training Recommendation Engine...")
+# Fill NaN using empty string
+df['combined_features'] = df['combined_features'].fillna('')
+# Initialize TF-IDF Vectorizer
+tfidf = TfidfVectorizer(stop_words='english')
+# Construct the TF-IDF Matrix
+tfidf_matrix = tfidf.fit_transform(df['combined_features'])
+# Compute Cosine Similarity Matrix
+cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
+
+# Map title to index for faster lookup
+indices = pd.Series(df.index, index=df['title']).drop_duplicates()
+print("Recommendation Engine Ready!")
+# ------------------------------------------
 
 # Lấy danh sách các cột genre one-hot
 GENRE_COLUMNS = [col for col in df.columns if col.startswith('genre_') and col != 'genre_list']
@@ -672,15 +690,25 @@ def get_dayofweek_analysis():
 @app.route('/api/movies/top-rated', methods=['GET'])
 def get_top_rated_movies():
     """Top phim có weighted rating cao nhất"""
+    page = int(request.args.get('page', 1))
     limit = request.args.get('limit', 20)
     
     if limit == 'all':
-        query = df.nlargest(5000, 'weighted_rating')
+        limit = 5000
     else:
-        try:
-            limit = int(limit)
-        except:
-            limit = 20
+        limit = int(limit)
+
+    # Base Query
+    base_query = df.nlargest(5000, 'weighted_rating')
+    total_results = len(base_query)
+        
+    if request.args.get('paged'):
+        # Pagination
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        query = base_query.iloc[start_idx:end_idx]
+    else:
+        # Backward compatibility: return top N
         query = df.nlargest(limit, 'weighted_rating')
 
     top_movies = query[
@@ -690,21 +718,41 @@ def get_top_rated_movies():
     # Sanitise clean NaNs
     top_movies = top_movies.where(pd.notnull(top_movies), None)
     result = top_movies.to_dict('records')
+    
+    # Return wrapper object only if requested
+    if request.args.get('paged'):
+        return jsonify({
+            'movies': result,
+            'page': page,
+            'total_pages': (total_results // limit) + (1 if total_results % limit > 0 else 0),
+            'total_results': total_results
+        })
+    
     return jsonify(result)
 
 
 @app.route('/api/movies/trending', methods=['GET'])
 def get_trending_movies():
     """Top phim thịnh hành nhất (dựa trên popularity)"""
+    page = int(request.args.get('page', 1))
     limit = request.args.get('limit', 20)
     
     if limit == 'all':
-        query = df.nlargest(5000, 'popularity')
+        limit = 5000
     else:
-        try:
-            limit = int(limit)
-        except:
-            limit = 20
+        limit = int(limit)
+
+    # Base Query
+    base_query = df.nlargest(5000, 'popularity')
+    total_results = len(base_query)
+        
+    if request.args.get('paged'):
+        # Pagination
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        query = base_query.iloc[start_idx:end_idx]
+    else:
+        # Backward compatibility
         query = df.nlargest(limit, 'popularity')
 
     trending_movies = query[
@@ -713,6 +761,15 @@ def get_trending_movies():
     ]
     trending_movies = trending_movies.where(pd.notnull(trending_movies), None)
     result = trending_movies.to_dict('records')
+    
+    if request.args.get('paged'):
+        return jsonify({
+            'movies': result,
+            'page': page,
+            'total_pages': (total_results // limit) + (1 if total_results % limit > 0 else 0),
+            'total_results': total_results
+        })
+
     return jsonify(result)
 
 
@@ -733,16 +790,26 @@ def get_movies_by_genre(genre):
     if not genre_col:
         return jsonify([]), 404
     
+    page = int(request.args.get('page', 1))
     limit = request.args.get('limit', 20)
     
     if limit == 'all':
-        query = df[df[genre_col] == 1].sort_values('weighted_rating', ascending=False).head(5000)
+        limit = 5000
     else:
-        try:
-            limit = int(limit)
-        except:
-            limit = 20
-        query = df[df[genre_col] == 1].nlargest(limit, 'weighted_rating')
+        limit = int(limit)
+
+    # Base Query
+    base_query = df[df[genre_col] == 1].sort_values('weighted_rating', ascending=False)
+    total_results = len(base_query)
+        
+    if request.args.get('paged'):
+        # Pagination
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        query = base_query.iloc[start_idx:end_idx]
+    else:
+        # Backward compatibility
+        query = base_query.head(limit if limit < 5000 else 5000)
     
     genre_movies = query[
         ['id', 'title', 'genre', 'release_year', 'vote_average', 'vote_count', 
@@ -750,24 +817,41 @@ def get_movies_by_genre(genre):
     ]
     genre_movies = genre_movies.where(pd.notnull(genre_movies), None)
     result = genre_movies.to_dict('records')
+    
+    if request.args.get('paged'):
+        return jsonify({
+            'movies': result,
+            'page': page,
+            'total_pages': (total_results // limit) + (1 if total_results % limit > 0 else 0),
+            'total_results': total_results
+        })
+
     return jsonify(result)
 
 
 @app.route('/api/movies/by-language/<language>', methods=['GET'])
 def get_movies_by_language(language):
     """Lấy phim theo ngôn ngữ"""
+    page = int(request.args.get('page', 1))
     limit = request.args.get('limit', 20)
     
-    filtered_df = df[df['original_language'] == language]
-    
     if limit == 'all':
-        query = filtered_df.sort_values('weighted_rating', ascending=False).head(5000)
+        limit = 5000
     else:
-        try:
-            limit = int(limit)
-        except:
-            limit = 20
-        query = filtered_df.nlargest(limit, 'weighted_rating')
+        limit = int(limit)
+    
+    filtered_df = df[df['original_language'] == language]
+    base_query = filtered_df.sort_values('weighted_rating', ascending=False)
+    total_results = len(base_query)
+    
+    if request.args.get('paged'):
+        # Pagination
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        query = base_query.iloc[start_idx:end_idx]
+    else:
+        # Backward compatibility
+        query = base_query.head(limit if limit < 5000 else 5000)
 
     lang_movies = query[
         ['id', 'title', 'genre', 'release_year', 'vote_average', 'vote_count', 
@@ -775,6 +859,15 @@ def get_movies_by_language(language):
     ]
     lang_movies = lang_movies.where(pd.notnull(lang_movies), None)
     result = lang_movies.to_dict('records')
+    
+    if request.args.get('paged'):
+        return jsonify({
+            'movies': result,
+            'page': page,
+            'total_pages': (total_results // limit) + (1 if total_results % limit > 0 else 0),
+            'total_results': total_results
+        })
+
     return jsonify(result)
 
 
@@ -1072,6 +1165,125 @@ def check_favorite(movie_id):
     is_favorite = movie_id in favorites
     return jsonify({'isFavorite': is_favorite}), 200
 
+
+@app.route('/api/movies/search', methods=['GET'])
+def search_movies():
+    query_text = request.args.get('q', '').strip()
+    genre = request.args.get('genre', '')
+    language = request.args.get('language', '')
+    page = int(request.args.get('page', 1))
+    limit = request.args.get('limit', 20)
+
+    filtered_df = df.copy()
+
+    # Filter by Title (Query)
+    if query_text:
+        # Use regex=False for literal matching, case=False for case-insensitivity
+        filtered_df = filtered_df[filtered_df['title'].astype(str).str.contains(query_text, case=False, regex=False, na=False)]
+
+    # Filter by Genre
+    if genre:
+        # Check standard genre column first
+        candidates = [f'genre_{genre.lower()}', f'genre_{genre.title()}', f'genre_{genre}']
+        genre_col = next((c for c in candidates if c in df.columns), None)
+        
+        if genre_col:
+             filtered_df = filtered_df[filtered_df[genre_col] == 1]
+        else:
+             # Fallback to string search in 'genre' column if specific column not found
+             filtered_df = filtered_df[filtered_df['genre'].astype(str).str.lower().str.contains(genre.lower(), na=False)]
+
+    # Filter by Language
+    if language:
+        filtered_df = filtered_df[filtered_df['original_language'] == language]
+
+    # Calculate Total Results
+    total_results = len(filtered_df)
+
+    # Pagination
+    if limit == 'all':
+        limit = 5000
+    else:
+        limit = int(limit)
+    
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    
+    paginated_movies = filtered_df.iloc[start_idx:end_idx]
+    
+    # Select Columns
+    columns_to_select = [
+        'id', 'title', 'genre', 'release_year', 'vote_average', 'vote_count', 
+        'weighted_rating', 'overview', 'original_language', 'popularity'
+    ]
+    # Add tagline and runtime if they exist in dataframe
+    if 'tagline' in paginated_movies.columns:
+        columns_to_select.append('tagline')
+    if 'runtime' in paginated_movies.columns:
+        columns_to_select.append('runtime')
+        
+    result_columns = [c for c in columns_to_select if c in paginated_movies.columns]
+    
+    movies_data = paginated_movies[result_columns].where(pd.notnull(paginated_movies), None).to_dict('records')
+    
+    return jsonify({
+        'movies': movies_data,
+        'total_results': total_results,
+        'page': page,
+        'total_pages': (total_results // limit) + (1 if total_results % limit > 0 else 0)
+    })
+
+@app.route('/api/recommend', methods=['GET'])
+def recommend_movies():
+    title = request.args.get('title', '').strip()
+    
+    if not title:
+        return jsonify({'error': 'Title is required'}), 400
+
+    # 1. Find the movie index
+    # Exact match first
+    if title in indices:
+        idx = indices[title]
+    else:
+        # Fuzzy match / Case-insensitive search
+        # Find titles containing the query
+        matches = df[df['title'].str.contains(title, case=False, regex=False, na=False)]
+        if matches.empty:
+            return jsonify({'error': 'Movie not found', 'movies': []}), 404
+        # Take the first match (most popular or first in list) to use as base
+        idx = matches.index[0]
+
+    # 2. Get similarity scores
+    sim_scores = list(enumerate(cosine_sim[idx]))
+
+    # 3. Sort by similarity
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+
+    # 4. Get top 10 recommended movies (excluding itself at index 0)
+    sim_scores = sim_scores[1:11]
+    
+    # 5. Get movie indices
+    movie_indices = [i[0] for i in sim_scores]
+
+    # 6. Retrieve movie details
+    # Define desired columns
+    desired_columns = [
+        'id', 'title', 'genre', 'release_year', 'vote_average', 'vote_count', 
+        'overview', 'poster_path', 'backdrop_path', 'weighted_rating'
+    ]
+    
+    # Only select columns that actually exist in the DataFrame
+    existing_columns = [col for col in desired_columns if col in df.columns]
+    
+    recommended_movies = df.iloc[movie_indices][existing_columns]
+    
+    # Fill NaN
+    recommended_movies = recommended_movies.where(pd.notnull(recommended_movies), None)
+    
+    return jsonify({
+        'source_movie': df.loc[idx, 'title'],
+        'movies': recommended_movies.to_dict('records')
+    })
 
 if __name__ == '__main__':
     print("\n" + "🎬" * 20)
