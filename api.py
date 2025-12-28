@@ -36,21 +36,19 @@ movies_collection = db['movies']
 
 # ... (Previous code)
 
-@app.route('/api/movies/<int:movie_id>/tmdb', methods=['GET'])
-def get_tmdb_info(movie_id):
-    """Lấy thông tin từ TMDB API (có cache vào MongoDB)"""
-    
+def fetch_and_cache_movie_data(movie_id):
+    """
+    Helper function to fetch movie data from TMDB and cache it in MongoDB.
+    Returns the movie data dictionary.
+    """
     # 1. Check Cache in MongoDB
     cached_movie = movies_collection.find_one({'_id': movie_id})
     if cached_movie:
-        # Return cached data (exclude internal fields if any)
-        return jsonify(cached_movie)
+        return cached_movie
     
     # 2. Prepare Data from CSV (Base info)
     movie_csv = df[df['id'] == movie_id]
     if movie_csv.empty:
-        # If not in CSV, we might still fetch from TMDB, but let's strictly rely on known movies for now or just proceed.
-        # Proceeding allows catching new movies if system expands.
         base_info = {'id': movie_id}
     else:
         row = movie_csv.iloc[0]
@@ -67,7 +65,7 @@ def get_tmdb_info(movie_id):
                     
                 genre_list = [get_genre_name_vi(g) for g in genre_list_raw if g]
             except Exception as e:
-                print(f"Error parsing genre_list in get_tmdb_info: {e}")
+                print(f"Error parsing genre_list: {e}")
                 
         base_info = {
             '_id': int(row['id']), # Use ID as MongoDB _id
@@ -116,10 +114,6 @@ def get_tmdb_info(movie_id):
                     'status': data.get('status')
                 }
                 
-                # Update base info with better overview/title from TMDB if available and CSV was poor?
-                # For now, we prioritize CSV for stats coherence, but TMDB images are key.
-                # Actually user requested to take movie info from TMDB. 
-                # Let's overwrite CSV overview if TMDB has one (often better/localized).
                 if data.get('overview'):
                     base_info['overview'] = data['overview']
                 if data.get('title'):
@@ -131,13 +125,20 @@ def get_tmdb_info(movie_id):
     # 4. Merge and Save to MongoDB
     final_data = {**base_info, **tmdb_info}
     
-    # Update or Insert (upsert=True just in case)
+    # Update or Insert
     try:
         movies_collection.replace_one({'_id': movie_id}, final_data, upsert=True)
     except Exception as e:
         print(f"Error saving to MongoDB: {e}")
     
-    return jsonify(final_data)
+    return final_data
+
+
+@app.route('/api/movies/<int:movie_id>/tmdb', methods=['GET'])
+def get_tmdb_info(movie_id):
+    """Lấy thông tin từ TMDB API (có cache vào MongoDB)"""
+    data = fetch_and_cache_movie_data(movie_id)
+    return jsonify(data)
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'super-secret-key-please-change')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 jwt = JWTManager(app)
@@ -156,6 +157,33 @@ df = load_data()
 # --- Content-Based Recommendation Setup ---
 print("Training Recommendation Engine...")
 # Fill NaN using empty string
+# df['combined_features'] = df['combined_features'].fillna('')
+
+# Reconstruct combined_features to boost Genre weight
+# Weight boosting: Genre x 3
+df['temp_genre_str'] = df['genre'].fillna('').str.replace(',', ' ')
+df['overview_str'] = df['overview'].fillna('').apply(lambda x: str(x).lower()) # Simple clean if needed matches clean_text logic roughly or just raw
+# Note: preprocessing.py used clean_text for overview. Let's assume overview in processed_dataset is original or check column.
+# 'overview_clean' exists in processed_dataset if preprocessing was run.
+if 'overview_clean' in df.columns:
+    df['overview_str'] = df['overview_clean'].fillna('')
+else:
+    df['overview_str'] = df['overview'].fillna('')
+
+# Boosting Genre Importance
+# Structure: Title + (Genre * 5) + Overview
+df['combined_features'] = (
+    df['title'].fillna('') + ' ' + 
+    (df['temp_genre_str'] + ' ') * 5 + ' ' + 
+    df['overview_str']
+)
+
+# Clean up temporary columns to avoid polluting checks (GENRE_COLUMNS relies on 'genre_' prefix)
+if 'temp_genre_str' in df.columns:
+    df.drop(columns=['temp_genre_str'], inplace=True)
+if 'overview_str' in df.columns:
+    df.drop(columns=['overview_str'], inplace=True)
+
 df['combined_features'] = df['combined_features'].fillna('')
 # Initialize TF-IDF Vectorizer
 tfidf = TfidfVectorizer(stop_words='english')
@@ -245,7 +273,57 @@ LANGUAGE_NAMES_VI = {
 def get_language_name_vi(lang_code: str) -> str:
     """Chuyển đổi mã ngôn ngữ sang tên tiếng Việt"""
     return LANGUAGE_NAMES_VI.get(lang_code.lower(), lang_code.upper())
+    return LANGUAGE_NAMES_VI.get(lang_code.lower(), lang_code.upper())
 
+
+def enrich_movies_with_images(movies_list):
+    """
+    Bổ sung thông tin ảnh (poster_path, backdrop_path) từ MongoDB cho danh sách phim.
+    Nếu chưa có trong DB thì fetch từ TMDB và cache lại.
+    """
+    if not movies_list:
+        return []
+        
+    # Lấy danh sách ID
+    movie_ids = [m['id'] for m in movies_list]
+    
+    # Query MongoDB
+    try:
+        images_cursor = movies_collection.find(
+            {'_id': {'$in': movie_ids}},
+            {'poster_path': 1, 'backdrop_path': 1}
+        )
+        
+        # Tạo map lookup: id -> image_info
+        images_map = {doc['_id']: doc for doc in images_cursor}
+        
+        # Merge vào danh sách kết quả
+        for movie in movies_list:
+            movie_id = movie['id']
+            
+            # Nếu chưa có trong DB, fetch ngay lập tức
+            if movie_id not in images_map:
+                try:
+                    # Fetch & Cache
+                    new_data = fetch_and_cache_movie_data(movie_id)
+                    images_map[movie_id] = new_data
+                except Exception as e:
+                    print(f"Error lazy fetching for {movie_id}: {e}")
+            
+            if movie_id in images_map:
+                img_data = images_map[movie_id]
+                movie['poster_path'] = img_data.get('poster_path')
+                movie['backdrop_path'] = img_data.get('backdrop_path')
+            else:
+                movie['poster_path'] = None
+                movie['backdrop_path'] = None
+                
+    except Exception as e:
+        print(f"Error enriching images from MongoDB: {e}")
+        # Nếu lỗi DB, vẫn trả về list phim gốc (không ảnh)
+        pass
+        
+    return movies_list
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -719,6 +797,9 @@ def get_top_rated_movies():
     top_movies = top_movies.where(pd.notnull(top_movies), None)
     result = top_movies.to_dict('records')
     
+    # Enrich with images from MongoDB
+    result = enrich_movies_with_images(result)
+    
     # Return wrapper object only if requested
     if request.args.get('paged'):
         return jsonify({
@@ -761,6 +842,9 @@ def get_trending_movies():
     ]
     trending_movies = trending_movies.where(pd.notnull(trending_movies), None)
     result = trending_movies.to_dict('records')
+    
+    # Enrich with images from MongoDB
+    result = enrich_movies_with_images(result)
     
     if request.args.get('paged'):
         return jsonify({
@@ -818,6 +902,9 @@ def get_movies_by_genre(genre):
     genre_movies = genre_movies.where(pd.notnull(genre_movies), None)
     result = genre_movies.to_dict('records')
     
+    # Enrich with images from MongoDB
+    result = enrich_movies_with_images(result)
+    
     if request.args.get('paged'):
         return jsonify({
             'movies': result,
@@ -859,6 +946,9 @@ def get_movies_by_language(language):
     ]
     lang_movies = lang_movies.where(pd.notnull(lang_movies), None)
     result = lang_movies.to_dict('records')
+    
+    # Enrich with images from MongoDB
+    result = enrich_movies_with_images(result)
     
     if request.args.get('paged'):
         return jsonify({
@@ -1130,8 +1220,19 @@ def toggle_favorite():
         return jsonify({'error': 'User not found'}), 404
 
     current_favorites = user.get('favorites', [])
+    action = data.get('action') # 'add' or 'remove' or None (toggle)
     
-    if movie_id in current_favorites:
+    should_add = False
+    
+    if action == 'remove':
+        should_add = False
+    elif action == 'add':
+        should_add = True
+    else:
+        # Toggle behavior
+        should_add = movie_id not in current_favorites
+        
+    if not should_add:
         users_collection.update_one(
             {'_id': ObjectId(user_id)},
             {'$pull': {'favorites': movie_id}}
@@ -1226,6 +1327,9 @@ def search_movies():
     
     movies_data = paginated_movies[result_columns].where(pd.notnull(paginated_movies), None).to_dict('records')
     
+    # Enrich with images from MongoDB
+    movies_data = enrich_movies_with_images(movies_data)
+    
     return jsonify({
         'movies': movies_data,
         'total_results': total_results,
@@ -1279,11 +1383,105 @@ def recommend_movies():
     
     # Fill NaN
     recommended_movies = recommended_movies.where(pd.notnull(recommended_movies), None)
+
+    result = recommended_movies.to_dict('records')
+    
+    # Enrich with images from MongoDB
+    result = enrich_movies_with_images(result)
     
     return jsonify({
         'source_movie': df.loc[idx, 'title'],
-        'movies': recommended_movies.to_dict('records')
+        'movies': result
     })
+
+@app.route('/api/user/recommendations', methods=['GET'])
+@jwt_required()
+def get_user_recommendations():
+    """Gợi ý phim dựa trên phim yêu thích gần nhất của người dùng"""
+    try:
+        from bson.objectid import ObjectId
+        user_id = get_jwt_identity()
+        user = users_collection.find_one({'_id': ObjectId(user_id)})
+        
+        if not user:
+            return jsonify({'movies': []}), 200
+            
+        favorites = user.get('favorites', [])
+        
+        # Nếu chưa có phim yêu thích nào
+        if not favorites:
+            return jsonify({'movies': []}), 200
+            
+        # Lấy phim yêu thích gần nhất (cuối danh sách) để gợi ý
+        # Có thể cải tiến bằng cách lấy random hoặc aggregate, nhưng last added là pattern tốt
+        last_fav_id = int(favorites[-1])
+        
+        # Tìm phim đó trong DataFrame
+        # Cần tìm title của phim này
+        source_movie_title = None
+        
+        # Check trong df
+        row = df[df['id'] == last_fav_id]
+        if not row.empty:
+            source_movie_title = row.iloc[0]['title']
+        else:
+            # Fallback: check MongoDB nếu movies được cache (ít khi xảy ra nếu dùng processed_dataset)
+             # Nếu không tìm thấy trong dataset tính toán (df), không thể recommend
+             return jsonify({'movies': []}), 200
+             
+        # Thực hiện recommend giống logic /api/recommend
+        if source_movie_title not in indices:
+             return jsonify({'movies': []}), 200
+             
+        idx = indices[source_movie_title]
+        sim_scores = list(enumerate(cosine_sim[idx]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        
+        # Lấy top 10 (bỏ qua chính nó ở index 0)
+        sim_scores = sim_scores[1:11]
+        movie_indices = [i[0] for i in sim_scores]
+        
+        desired_columns = [
+            'id', 'title', 'genre', 'release_year', 'vote_average', 'vote_count', 
+            'overview', 'poster_path', 'backdrop_path', 'weighted_rating'
+        ]
+        existing_columns = [col for col in desired_columns if col in df.columns]
+        
+        rec_movies = df.iloc[movie_indices][existing_columns]
+        rec_movies = rec_movies.where(pd.notnull(rec_movies), None)
+        result = rec_movies.to_dict('records')
+        
+        # Enrich images
+        result = enrich_movies_with_images(result)
+        
+        return jsonify({
+            'source_movie': source_movie_title,
+            'movies': result
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in user recommendations: {e}")
+        return jsonify({'movies': []}), 500
+
+# --- Model Evaluation Endpoint ---
+EVALUATION_CACHE = None
+
+@app.route('/api/evaluation', methods=['GET'])
+def get_model_evaluation():
+    global EVALUATION_CACHE
+    if EVALUATION_CACHE:
+        return jsonify(EVALUATION_CACHE)
+    
+    try:
+        from evaluation import evaluate_model
+        # Use a smaller sample for live demo speed, or 500 for better accuracy
+        results = evaluate_model(df, cosine_sim, indices, sample_size=200)
+        EVALUATION_CACHE = results
+        return jsonify(results)
+    except Exception as e:
+        print(f"Evaluation Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     print("\n" + "🎬" * 20)
